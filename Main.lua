@@ -1,4 +1,4 @@
-local REPO_URL = "https://github.com/james-arcen/Sailor-Piece-Hub-modular/tree/main/Sailor%20Piece%20Modular"
+local REPO_URL = "https://raw.githubusercontent.com/james-arcen/Sailor-Piece-Hub-modular/main/Sailor%20Piece%20Modular"
 local moduleCache = {}
 
 pcall(function()
@@ -32,7 +32,7 @@ end
 local Config = { HubName = "Sailor Piece Hub Pro", Version = "1.0.2" }
 local Core = { Modules = {} }
 
-Core.UI = Import("Ui/Rayfield")
+Core.UI = Import("Ui/UI")
 local CombatService = Import("Services/CombatService")
 CombatService:Init()
 
