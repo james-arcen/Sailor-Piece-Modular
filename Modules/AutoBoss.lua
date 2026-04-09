@@ -1,0 +1,408 @@
+-- ========================================================================
+-- 👑 MODULE: ADVANCED AUTO BOSS (QUEUE + CHAT SNIPER + PATIENCE)
+-- ========================================================================
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+local LP = Players.LocalPlayer
+local UI = Import("Ui/UI")
+local TeleportService = Import("Services/Teleport")
+local GameData = Import("Config/GameData")
+local CombatService = Import("Services/CombatService")
+local PriorityService = Import("Services/PriorityService")
+local SpawnService = Import("Services/SpawnService")
+local RandomService = Import("Services/RandomService")
+
+local Module = { NoToggle = true }
+
+function Module:Init()
+    self.IsRunning = false
+    self.BossQueue = {} 
+    self.AllBosses = {}
+    
+    self.ChatConnections = {}
+    self.BossStateCache = {} 
+    self.DeadTimes = {}      
+    
+    for island, quests in pairs(GameData.QuestDataMap) do
+        for _, q in ipairs(quests) do
+            if q.Type == "Boss" then
+                table.insert(self.AllBosses, { Target = q.Target, Island = island })
+            end
+        end
+    end
+
+    if GameData.TimedBosses then
+        for island, bosses in pairs(GameData.TimedBosses) do
+            for _, bossName in ipairs(bosses) do
+                table.insert(self.AllBosses, { Target = bossName, Island = island })
+            end
+        end
+    end
+end
+
+function Module:GetCurrentIsland(hrp)
+    local closestIsland, minDist = nil, math.huge
+    local serviceFolder = Workspace:FindFirstChild("ServiceNPCs")
+    if not serviceFolder then return nil end
+
+    for npcName, islandName in pairs(GameData.NpcToIsland) do
+        local npc = serviceFolder:FindFirstChild(npcName)
+        if npc and npc:FindFirstChild("HumanoidRootPart") then
+            local dist = (hrp.Position - npc.HumanoidRootPart.Position).Magnitude
+            if dist < minDist then minDist, closestIsland = dist, islandName end
+        end
+    end
+    return closestIsland
+end
+
+function Module:GetBossModel(targetName)
+    local closest, minDist = nil, math.huge
+    local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local cleanTarget = targetName:lower():gsub("%s+", "")
+
+    for _, folder in ipairs(Workspace:GetChildren()) do
+        if folder.Name == "NPCs" or folder.Name:find("BossSpawn_") or folder.Name:find("TimedBoss") then
+            for _, npc in ipairs(folder:GetDescendants()) do
+                if npc:IsA("Model") then
+                    local hum = npc:FindFirstChild("Humanoid")
+                    local npcBase = npc:FindFirstChild("HumanoidRootPart")
+                    if hum and hum.Health > 0 and npcBase then
+                        local cleanNpcName = npc.Name:gsub("%d+", ""):lower():gsub("%s+", "")
+                        if cleanNpcName == cleanTarget then
+                            local dist = (hrp.Position - npcBase.Position).Magnitude
+                            if dist < minDist then minDist, closest = dist, npc end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+function Module:MonitorChat(msg)
+    if not self.IsRunning then return end
+    
+    local text = string.lower(msg)
+    local msgNoSpaces = text:gsub("%s+", "")
+    
+    for _, b in ipairs(self.BossQueue) do
+        local chatNameTranslation = GameData.BossChatNames and GameData.BossChatNames[b.Target]
+        local baseName
+        
+        if chatNameTranslation then
+            baseName = string.lower(chatNameTranslation):gsub("%s+", "")
+        else
+            baseName = string.lower(b.Target:gsub("Boss", ""):gsub("Mini", "")):gsub("%s+", "")
+        end
+        
+        if msgNoSpaces:find(baseName) then 
+            if text:find("spawned") then
+                self.BossStateCache[b.Target] = "Alive"
+                self.DeadTimes[b.Target] = nil
+            elseif text:find("defeated") then
+                self.BossStateCache[b.Target] = "Dead"
+                self.DeadTimes[b.Target] = tick()
+            end
+        end
+    end
+end
+
+function Module:StartChatSniper()
+    pcall(function()
+        if TextChatService then
+            table.insert(self.ChatConnections, TextChatService.MessageReceived:Connect(function(msg)
+                if msg and msg.Text then self:MonitorChat(msg.Text) end
+            end))
+        end
+    end)
+    pcall(function()
+        local defaultChat = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+        if defaultChat and defaultChat:FindFirstChild("OnMessageDoneFiltering") then
+            table.insert(self.ChatConnections, defaultChat.OnMessageDoneFiltering.OnClientEvent:Connect(function(msgData)
+                if msgData and msgData.Message then self:MonitorChat(msgData.Message) end
+            end))
+        end
+    end)
+end
+
+function Module:StopChatSniper()
+    for _, conn in ipairs(self.ChatConnections) do conn:Disconnect() end
+    table.clear(self.ChatConnections)
+end
+
+local function CreateDynamicDropdown(container, defaultText, options, callback)
+    local dropdownFrame = Instance.new("Frame")
+    dropdownFrame.Size = UDim2.new(1, -10, 0, 35)
+    dropdownFrame.BackgroundTransparency = 1
+    dropdownFrame.ClipsDescendants = true
+    dropdownFrame.Parent = container
+
+    local mainBtn = Instance.new("TextButton")
+    mainBtn.Size = UDim2.new(1, 0, 0, 35)
+    mainBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+    mainBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    mainBtn.Font = Enum.Font.GothamBold
+    mainBtn.TextSize = 13
+    mainBtn.Text = defaultText .. " ▼"
+    mainBtn.Parent = dropdownFrame
+    Instance.new("UICorner", mainBtn).CornerRadius = UDim.new(0, 4)
+
+    local optionsContainer = Instance.new("ScrollingFrame")
+    optionsContainer.Size = UDim2.new(1, 0, 1, -40)
+    optionsContainer.Position = UDim2.new(0, 0, 0, 40)
+    optionsContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    optionsContainer.ScrollBarThickness = 2
+    optionsContainer.Parent = dropdownFrame
+    Instance.new("UICorner", optionsContainer).CornerRadius = UDim.new(0, 4)
+
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.Parent = optionsContainer
+
+    local isOpen = false
+
+    mainBtn.MouseButton1Click:Connect(function()
+        isOpen = not isOpen
+        mainBtn.Text = defaultText .. (isOpen and " ▲" or " ▼")
+        dropdownFrame.Size = isOpen and UDim2.new(1, -10, 0, 130) or UDim2.new(1, -10, 0, 35)
+    end)
+
+    local function populate(newOptions)
+        for _, child in ipairs(optionsContainer:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+        for _, option in ipairs(newOptions) do
+            local optBtn = Instance.new("TextButton")
+            optBtn.Size = UDim2.new(1, -5, 0, 25)
+            optBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            optBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+            optBtn.Font = Enum.Font.GothamSemibold
+            optBtn.TextSize = 12
+            
+            local displayText = type(option) == "table" and option.Target or option
+            optBtn.Text = displayText
+            optBtn.Parent = optionsContainer
+            Instance.new("UICorner", optBtn).CornerRadius = UDim.new(0, 4)
+
+            optBtn.MouseButton1Click:Connect(function()
+                isOpen = false
+                defaultText = "📍 " .. displayText
+                mainBtn.Text = defaultText .. " ▼"
+                dropdownFrame.Size = UDim2.new(1, -10, 0, 35)
+                if callback then callback(option) end
+            end)
+        end
+        task.wait(0.1)
+        optionsContainer.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y)
+    end
+
+    populate(options)
+    
+    return {
+        Refresh = function(newOptions, resetText)
+            defaultText = resetText
+            mainBtn.Text = defaultText .. " ▼"
+            populate(newOptions)
+        end
+    }
+end
+
+function Module:Start()
+    local tabName = "Chefes (Boss)"
+    UI:CreateSection(tabName, "Filter & Selection")
+    local container = UI.Tabs[tabName].Container
+
+    local filterOptions = { "Todas as Ilhas" }
+    for _, island in ipairs(GameData.IslandsInOrder) do table.insert(filterOptions, island) end
+
+    local currentFilter = "Todas as Ilhas"
+    local filteredBosses = {}
+    local selectedToAdd = nil
+    local selectedToRemoveIndex = nil
+
+    local bossDropdown
+    local queueDropdown
+
+    local function UpdateFilteredBosses()
+        filteredBosses = {}
+        for _, b in ipairs(self.AllBosses) do
+            if currentFilter == "Todas as Ilhas" or b.Island == currentFilter then
+                table.insert(filteredBosses, b)
+            end
+        end
+        selectedToAdd = filteredBosses[1]
+    end
+    UpdateFilteredBosses()
+
+    local function RefreshQueueUI()
+        local queueDisplay = {}
+        for i, b in ipairs(self.BossQueue) do
+            table.insert(queueDisplay, { Target = i .. ". " .. b.Target, Index = i })
+        end
+        if #queueDisplay == 0 then table.insert(queueDisplay, { Target = "Fila Vazia", Index = 0 }) end
+        
+        selectedToRemoveIndex = queueDisplay[1].Index
+        if queueDropdown then queueDropdown.Refresh(queueDisplay, "🗑️ Remover: " .. queueDisplay[1].Target) end
+    end
+
+    CreateDynamicDropdown(container, "🌐 Filter: All Islands", filterOptions, function(island)
+        currentFilter = island
+        UpdateFilteredBosses()
+        if selectedToAdd then
+            bossDropdown.Refresh(filteredBosses, "💀 Boss: " .. selectedToAdd.Target)
+        end
+    end)
+
+    bossDropdown = CreateDynamicDropdown(container, "💀 Boss: " .. (selectedToAdd and selectedToAdd.Target or "Nenhum"), filteredBosses, function(boss)
+        selectedToAdd = boss
+    end)
+
+    UI:CreateButton(tabName, "➕ Add Boss to Queue", function()
+        if selectedToAdd then
+            table.insert(self.BossQueue, selectedToAdd)
+            RefreshQueueUI()
+        end
+    end)
+
+    UI:CreateSection(tabName, "Manage Queue")
+
+    queueDropdown = CreateDynamicDropdown(container, "🗑️ Selecione para Remover", {{Target="Fila Vazia", Index=0}}, function(qItem)
+        selectedToRemoveIndex = qItem.Index
+    end)
+
+    UI:CreateButton(tabName, "➖ Remove from Queue", function()
+        if selectedToRemoveIndex and selectedToRemoveIndex > 0 then
+            table.remove(self.BossQueue, selectedToRemoveIndex)
+            RefreshQueueUI()
+        end
+    end)
+
+    UI:CreateToggle(tabName, "Enable Auto Boss (Smart Queue)", function(state) self:Toggle(state) end)
+    RefreshQueueUI()
+end
+
+function Module:StartFarm()
+    if self.IsRunning then return end
+    
+    self.IsRunning = true
+    self:StopChatSniper()
+    self:StartChatSniper()
+    CombatService:Start()
+    
+    self.BossStateCache = {}
+    self.DeadTimes = {}
+    self.TargetBossModel = nil
+    self.Patience = 0 
+
+    if self.BrainLoop then task.cancel(self.BrainLoop); self.BrainLoop = nil end
+
+    self.BrainLoop = task.spawn(function()
+        while self.IsRunning and task.wait(1) do
+            
+            if #self.BossQueue == 0 then
+                if self.TargetBossModel then CombatService:SetTarget(nil, false); self.TargetBossModel = nil end
+                PriorityService:Release("AutoBoss")
+                self.Patience = 0
+                continue
+            end
+
+            for _, b in ipairs(self.BossQueue) do
+                local tName = b.Target
+                if self.BossStateCache[tName] == "Dead" and self.DeadTimes[tName] then
+                    local respawnTime = GameData.SilentBosses and GameData.SilentBosses[tName]
+                    if respawnTime and (tick() - self.DeadTimes[tName] > respawnTime) then
+                        self.BossStateCache[tName] = "PendingCheck"
+                        self.DeadTimes[tName] = nil
+                    end
+                end
+            end
+
+            local currentBoss = nil
+            for _, b in ipairs(self.BossQueue) do
+                local state = self.BossStateCache[b.Target]
+                if state == nil then state = "PendingCheck" end 
+                if state == "Alive" or state == "PendingCheck" then currentBoss = b; break end
+            end
+
+            if not currentBoss then
+                if self.TargetBossModel then CombatService:SetTarget(nil, false); self.TargetBossModel = nil end
+                PriorityService:Release("AutoBoss")
+                self.Patience = 0
+                task.wait(1)
+                continue
+            else
+                PriorityService:Request("AutoBoss")
+            end
+
+            if PriorityService:GetPermittedTask() ~= "AutoBoss" then
+                task.wait(1)
+                continue
+            end
+
+            local char = LP.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if not hrp then continue end
+            
+            local currentIsland = self:GetCurrentIsland(hrp)
+            if currentIsland ~= currentBoss.Island then
+                if self.TargetBossModel then CombatService:SetTarget(nil, false); self.TargetBossModel = nil end
+                self.Patience = 0
+                TeleportService:TeleportToIsland(currentBoss.Island)
+                SpawnService.SpawnSetado = false
+                RandomService:Wait(1.5, 2.5)
+                continue
+            end
+            
+            if not SpawnService.SpawnSetado then
+                CombatService:SetTarget(nil, false)
+                SpawnService:SetSpawn()
+                task.wait(1)
+                continue
+            end
+            
+            if not self.TargetBossModel or not self.TargetBossModel:FindFirstChild("Humanoid") or self.TargetBossModel.Humanoid.Health <= 0 then
+                self.TargetBossModel = self:GetBossModel(currentBoss.Target)
+            end
+            
+            if self.TargetBossModel then
+                self.BossStateCache[currentBoss.Target] = "Alive"
+                self.Patience = 0
+                CombatService:SetTarget(self.TargetBossModel, true)
+            else
+                CombatService:SetTarget(nil, false)
+                self.TargetBossModel = nil
+                self.Patience = self.Patience + 1
+                local maxPatience = (self.BossStateCache[currentBoss.Target] == "Alive") and 10 or 5
+                
+                if self.Patience >= maxPatience then
+                    self.BossStateCache[currentBoss.Target] = "Dead"
+                    self.DeadTimes[currentBoss.Target] = tick()
+                    self.Patience = 0
+                    RandomService:Wait(0.5, 1.0)
+                else
+                    RandomService:Wait(1.0, 1.5)
+                end
+            end
+        end
+    end)
+end
+
+function Module:StopFarm()
+    self.IsRunning = false
+    self:StopChatSniper()
+    if self.BrainLoop then task.cancel(self.BrainLoop); self.BrainLoop = nil end
+    CombatService:Stop()
+    PriorityService:Release("AutoBoss")
+end
+
+function Module:Toggle(state)
+    if state then self:StartFarm() else self:StopFarm() end
+end
+
+return Module
